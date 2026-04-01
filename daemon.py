@@ -5,115 +5,216 @@ This service watches the Downloads directory, classifies files with a trained
 model, moves them into category directories, and records actions in SQLite.
 """
 
-# =============================
-# Standard library imports
-# =============================
 import time
-import sys
-import logging
 import os
 import pwd
 import sqlite3
 import shutil
-import joblib
 import magic
+import logging
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# =============================
-# Runtime configuration
-# =============================
+# ================== 1. Configuration ==================
+RETENTION_MINUTES = 5 
 
-# [UPDATE: Hansol] Synchronize logging with the local system timezone (e.g., EST)
-# This ensures timestamps match the actual time the user sees.
-logging.Formatter.converter = time.localtime
-
-def get_downloads_dir():
-    """Determine the Downloads folder of the script owner."""
-    script_uid = os.stat(__file__).st_uid
-    home_dir = pwd.getpwuid(script_uid).pw_dir
-    return os.path.join(home_dir, "Downloads")
+EXTENSION_RULES = {
+    '.heic': 'Pictures', '.jpg': 'Pictures', '.jpeg': 'Pictures', '.png': 'Pictures', '.gif': 'Pictures',
+    '.avi': 'Videos', '.mp4': 'Videos', '.mkv': 'Videos', '.mov': 'Videos',
+    '.mp3': 'Music', '.wav': 'Music',
+    '.pdf': 'Documents', '.docx': 'Documents', '.txt': 'Documents',
+    '.zip': 'Downloads', '.gz': 'Downloads'
+}
 
 def get_real_user_info():
-    """Resolve the real user account owning this script and its home directory."""
     try:
-        script_stat = os.stat(__file__)
-        user_info = pwd.getpwuid(script_stat.st_uid)
-        return user_info.pw_name, user_info.pw_dir
+        real_user = os.environ.get('SUDO_USER') or pwd.getpwuid(os.getuid()).pw_name
+        user_home = os.path.expanduser(f"~{real_user}")
+        return real_user, user_home
     except Exception:
         return os.getlogin(), os.path.expanduser("~")
 
-REAL_USER, USER_HOME = get_real_user_info()
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = f"{PROJECT_DIR}/download_daemon.log"
+REAL_USER, USER_HOME = get_real_user_info()
+DOWNLOADS_DIR = os.path.join(USER_HOME, "Downloads")
 DB_PATH = os.path.join(PROJECT_DIR, "file_tracker.db")
-MODEL_PATH = os.path.join(PROJECT_DIR, "file_classifier.pkl")
-VECTORIZER_PATH = os.path.join(PROJECT_DIR, "vectorizer.pkl")
 
-TEMP_EXTENSIONS = {'.part', '.crdownload', '.tmp', '.download'}
+logging.basicConfig(
+    filename=f"{PROJECT_DIR}/download_daemon.log", 
+    level=logging.INFO, 
+    format='%(asctime)s - %(message)s'
+)
 
-# [UPDATE: Hansol] Standardized logging format with local timestamps
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
-                    format='%(asctime)s - %(message)s')
+# ================== 2. Utilities ==================
 
+def notify_user(filename):
+    """Send a desktop notification to the real user.
 
-# =============================
-# Deferred retention policy notes
-# =============================
+    When running as a root systemd service, we try three approaches in order
+    and stop at the first one that succeeds:
 
-"""
-Elisei's note: potential change to just notofying the user that they
-didn't use that file instead of deleting it
-"""
-# def cleanup_expired_files():
-#     """[UPDATE: Hansol] Automated 2-hour retention policy (Test Mode)."""
-#     limit = datetime.now() - timedelta(hours=2)
-#     with sqlite3.connect(DB_PATH) as conn:
-#         expired = conn.execute("SELECT id, path FROM tracked_files WHERE date < ?", (limit.isoformat(),)).fetchall()
-#         for fid, fpath in expired:
-#             if os.path.exists(fpath):
-#                 os.remove(fpath)
-#                 logging.info(f"Cleanup: Deleted expired file {fpath}")
-#             conn.execute("DELETE FROM tracked_files WHERE id = ?", (fid,))
+    1. sudo -u with explicit DISPLAY, DBUS, and XDG_RUNTIME_DIR env vars.
+    2. systemd-run inside the user's own session (requires lingering enabled).
+    3. su -c as a last resort.
+    """
+    uid = pwd.getpwnam(REAL_USER).pw_uid
+    message = f"'{filename}' moved to TemporaryFile_Trash folder."
+    dbus_addr = f"unix:path=/run/user/{uid}/bus"
+    xdg_dir   = f"/run/user/{uid}"
 
-# =============================
-# File readiness and event handling
-# =============================
+    strategies = [
+        # 1. sudo -u with all required GUI env vars explicitly set
+        [
+            "sudo", "-u", REAL_USER,
+            "env",
+            "DISPLAY=:0",
+            f"DBUS_SESSION_BUS_ADDRESS={dbus_addr}",
+            f"XDG_RUNTIME_DIR={xdg_dir}",
+            "notify-send", "--urgency=normal", "File Moved", message
+        ],
+        # 2. systemd-run inside the user's session
+        [
+            "systemd-run",
+            f"--uid={REAL_USER}",
+            f"--setenv=DISPLAY=:0",
+            f"--setenv=DBUS_SESSION_BUS_ADDRESS={dbus_addr}",
+            f"--setenv=XDG_RUNTIME_DIR={xdg_dir}",
+            "--pipe", "--wait", "--quiet",
+            "notify-send", "--urgency=normal", "File Moved", message
+        ],
+        # 3. su fallback
+        [
+            "su", "-", REAL_USER, "-c",
+            f"DISPLAY=:0 "
+            f"DBUS_SESSION_BUS_ADDRESS={dbus_addr} "
+            f"XDG_RUNTIME_DIR={xdg_dir} "
+            f"notify-send --urgency=normal 'File Moved' '{message}'"
+        ],
+    ]
+
+    for cmd in strategies:
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=5)
+            if result.returncode == 0:
+                logging.info(f"notify_user succeeded: {' '.join(cmd[:3])}")
+                return
+            logging.warning(
+                f"notify_user strategy failed (rc={result.returncode}): "
+                f"{' '.join(cmd[:4])} | stderr: {result.stderr.decode().strip()}"
+            )
+        except Exception as e:
+            logging.warning(f"notify_user strategy error: {e}")
+
+    logging.error("notify_user: all strategies failed")
+
+def safe_dest(directory: str, filename: str) -> str:
+    """
+    Return a collision-free destination path.
+    If a file with the same name already exists, appends a timestamp:
+    stem_YYYYMMDD_HHMMSS.ext
+    Truncates the stem to 200 chars to stay within the OS 255-char filename limit.
+    """
+    dest = os.path.join(directory, filename)
+    if not os.path.exists(dest):
+        return dest
+    p      = Path(filename)
+    suffix = p.suffix
+    stem   = p.stem[:200]   # safety margin for the 255-char OS limit
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(directory, f"{stem}_{ts}{suffix}")
 
 def is_file_finished(filepath):
-        """Return True when file size is stable and the file is ready to move."""
-        try:
-            if os.path.getsize(filepath) == 0: return False
-            size1 = os.path.getsize(filepath)
-            time.sleep(0.5)
-            size2 = os.path.getsize(filepath)
-            return size1 == size2
-        except OSError: return False
+    try:
+        if os.path.getsize(filepath) == 0: return False
+        size1 = os.path.getsize(filepath)
+        time.sleep(0.5)
+        size2 = os.path.getsize(filepath)
+        return size1 == size2
+    except OSError: return False
+
+def has_been_opened(fpath):
+    """
+    Return True if the file has been opened at least once after being tracked.
+
+    Strategy:
+      - At distribution time, we snapshot the file's atime as `initial_atime`.
+      - If the current atime has advanced beyond that baseline by more than
+        2 seconds (filesystem noise tolerance), the user opened the file.
+      - Falls back to comparing atime vs mtime when no DB baseline exists.
+    """
+    try:
+        current_atime = os.path.getatime(fpath)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT initial_atime FROM tracked_files WHERE path = ?", (fpath,)
+            ).fetchone()
+
+        if row and row[0] is not None:
+            baseline_atime = row[0]
+        else:
+            baseline_atime = os.path.getmtime(fpath)
+
+        # 2-second tolerance to ignore filesystem/OS noise
+        return current_atime > baseline_atime + 2
+
+    except Exception:
+        return False
+
+# ================== 3. Core Trash Logic ==================
+
+def cleanup_expired_files():
+    """Move files that have NEVER been opened after RETENTION_MINUTES to TemporaryFile_Trash."""
+    limit_time = datetime.now() - timedelta(minutes=RETENTION_MINUTES)
+    limit_timestamp = limit_time.timestamp()
+
+    trash_dir = os.path.join(USER_HOME, "TemporaryFile_Trash")  # renamed from Archive_Trash
+    if not os.path.exists(trash_dir):
+        os.makedirs(trash_dir, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        tracked = conn.execute("SELECT id, path FROM tracked_files").fetchall()
+
+        for fid, fpath in tracked:
+            try:
+                if os.path.exists(fpath):
+                    # Only act on files older than the retention window
+                    if os.path.getmtime(fpath) < limit_timestamp:
+
+                        # ── Guard: skip files the user has opened ──────────
+                        if has_been_opened(fpath):
+                            logging.info(f"SKIPPED (opened by user): {os.path.basename(fpath)}")
+                            # Remove from tracking – no need to keep checking
+                            conn.execute("DELETE FROM tracked_files WHERE id = ?", (fid,))
+                            continue
+                        # ──────────────────────────────────────────────────
+
+                        filename  = os.path.basename(fpath)
+                        dest_path = safe_dest(trash_dir, filename)
+
+                        shutil.move(fpath, dest_path)
+                        notify_user(filename)
+                        logging.info(f"MOVED TO TemporaryFile_Trash: {filename}")
+                        conn.execute("DELETE FROM tracked_files WHERE id = ?", (fid,))
+                else:
+                    conn.execute("DELETE FROM tracked_files WHERE id = ?", (fid,))
+            except Exception as e:
+                logging.error(f"Error processing {fpath}: {e}")
+
+# ================== 4. Distribution Logic ==================
 
 class DownloadHandler(FileSystemEventHandler):
-    """Watchdog event handler for classifying and moving downloaded files."""
-
-    def __init__(self):
-        # [UPDATE: Hansol] Load AI engine into memory at startup
-        self.model = joblib.load(MODEL_PATH)
-        self.vectorizer = joblib.load(VECTORIZER_PATH)
-
     def on_created(self, event):
-        """Handle new file creation events from the Downloads directory."""
         if not event.is_directory: self.handle_event(event.src_path)
-
     def on_moved(self, event):
-        """Catch files renamed by browsers (e.g., .crdownload -> .avi)."""
         if not event.is_directory: self.handle_event(event.dest_path)
 
     def handle_event(self, src_path):
-        """Gate temporary files and process finalized files when ready."""
         filepath = Path(src_path)
-        if filepath.suffix.lower() in TEMP_EXTENSIONS: return
-
-        # Try to process the file as soon as it's ready
+        if filepath.suffix.lower() in {'.part', '.crdownload', '.tmp'}: return
         for _ in range(10):
             if is_file_finished(str(filepath)):
                 self.process_file(filepath)
@@ -121,73 +222,63 @@ class DownloadHandler(FileSystemEventHandler):
             time.sleep(1)
 
     def process_file(self, filepath):
-        """Classify, move, and persist metadata for a downloaded file."""
-
-        time.sleep(1)
-        if not filepath.exists():
-            return
-
-        """Leader's flow + Hansol's AI movement logic."""
         try:
             filename = filepath.name
-            mime = magic.from_file(str(filepath), mime=True)
-            size = os.path.getsize(filepath)
+            ext = filepath.suffix.lower()
+            category = EXTENSION_RULES.get(ext)
+            
+            if not category:
+                mime = magic.from_file(str(filepath), mime=True)
+                if "video" in mime: category = "Videos"
+                elif "audio" in mime: category = "Music"
+                elif "image" in mime: category = "Pictures"
+                else: category = "Downloads"
 
-            """
-            Elisei's note: the prediction should be made based on MIME, ext, filename, and size'
-            """
-            
-            # [UPDATE: Hansol] Local AI Classification
-            vec = self.vectorizer.transform([filename])
-            category = self.model.predict(vec)[0]
-            
-            # [UPDATE: Hansol] Dynamic destination based on real user home
             target_dir = os.path.join(USER_HOME, category)
-            if not os.path.exists(target_dir): 
-                os.makedirs(target_dir)
+            os.makedirs(target_dir, exist_ok=True)
+            dest_path = safe_dest(target_dir, filename)
             
-            dest_path = os.path.join(target_dir, filename)
             shutil.move(str(filepath), dest_path)
 
-            # Record in DB for the 2-hour retention task
+            # Snapshot atime right after move – used as baseline for open-detection
+            initial_atime = os.path.getatime(dest_path)
             with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("INSERT INTO files (path, filename, size, data) VALUES (?, ?, ?, ?)", (dest_path, filename, size, datetime.now()))
-            # [UPDATE: Hansol] Log with explicit local time format
-            log_time = time.strftime('%Y-%m-%d %H:%M:%S')
-            log_entry = f"Categorized: {filename} ({mime}) -> {category}"
-            logging.info(log_entry)
-            
-
+                conn.execute(
+                    "INSERT INTO tracked_files (path, date, initial_atime) VALUES (?, ?, ?)",
+                    (dest_path, datetime.now(), initial_atime)
+                )
+            logging.info(f"DISTRIBUTED: {filename} -> {target_dir}")
         except Exception as e:
-            logging.error(f"Error processing {filepath}: {e}")
-
-
-
-# =============================
-# Daemon entrypoint
-# =============================
+            logging.error(f"Error distributing {filepath}: {e}")
 
 def main():
-    """Start filesystem monitoring and keep the daemon process alive."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracked_files (
+                id            INTEGER PRIMARY KEY,
+                path          TEXT,
+                date          TIMESTAMP,
+                initial_atime REAL        -- atime snapshot taken right after download
+            )
+        """)
+        # Migrate existing DB rows that don't have initial_atime yet
+        try:
+            conn.execute("ALTER TABLE tracked_files ADD COLUMN initial_atime REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists – safe to ignore
 
-    logging.info(f"Daemon started")
-    event_handler = DownloadHandler()
     observer = Observer()
-    observer.schedule(event_handler, get_downloads_dir(), recursive=False)
+    observer.schedule(DownloadHandler(), DOWNLOADS_DIR, recursive=False)
     observer.start()
-    
+    logging.info(f"Daemon monitoring {DOWNLOADS_DIR} for user {REAL_USER}")
+
     try:
         while True:
-            # Check for expired files every 10 minutes
-            # cleanup_expired_files()
-            time.sleep(1)
+            cleanup_expired_files()
+            time.sleep(60)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logging.info("Daemon stopped.")
-        sys.exit(0)
+    main()
